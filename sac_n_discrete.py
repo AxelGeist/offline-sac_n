@@ -19,7 +19,7 @@ import wandb
 from torch.distributions import Normal
 from tqdm import trange
 
-from os import sys
+import sys
 #put the path to the directory that contains your four-rooms repo here!
 sys.path.append('/Users/caroline/Desktop/projects/repos/')
 from four_room.env import FourRoomsEnv
@@ -49,6 +49,8 @@ class TrainConfig:
     batch_size: int = 256
     num_epochs: int = 3000
     num_updates_on_epoch: int = 1000
+    # num_epochs: int = 100
+    # num_updates_on_epoch: int = 10
     normalize_reward: bool = False
     # evaluation params
     eval_episodes: int = 10
@@ -59,7 +61,7 @@ class TrainConfig:
     train_seed: int = 10
     eval_seed: int = 42
     log_every: int = 100
-    device: str = "cpu"
+    device: str = "cuda"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
@@ -124,7 +126,7 @@ class ReplayBuffer:
         state_dim: int,
         action_dim: int,
         buffer_size: int,
-        device: str = "cpu",
+        device: str = "cuda",
     ):
         self._buffer_size = buffer_size
         self._pointer = 0
@@ -213,6 +215,7 @@ class Actor(nn.Module):
         self, state_dim: int, num_actions: int, hidden_dim: int
     ):
         super().__init__()
+        print("state_dim, hidden_dim: [", state_dim, ", ", hidden_dim, "]")
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -245,19 +248,30 @@ class Actor(nn.Module):
         deterministic: bool = False,
         need_log_prob: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        hidden = self.trunk(state)
-        #mu, log_sigma = self.mu(hidden), self.log_sigma(hidden)
+        try:
+            # print("Forward State: ", state.shape)
+            hidden = self.trunk(state)
+            # print("Forward Hidden: ", hidden.shape)
+            # mu, log_sigma = self.mu(hidden), self.log_sigma(hidden)
 
-        # clipping params from EDAC paper, not as in SAC paper (-20, 2)
-        #log_sigma = torch.clip(log_sigma, -5, 2)
-        #policy_dist = Normal(mu, torch.exp(log_sigma))
+            # clipping params from EDAC paper, not as in SAC paper (-20, 2)
+            # log_sigma = torch.clip(log_sigma, -5, 2)
+            # policy_dist = Normal(mu, torch.exp(log_sigma))
 
         # This outputs the logits of the distribution over actions
-        policy_probs = self.policy(hidden)
-        policy_dist = torch.distributions.categorical.Categorical(probs=policy_probs)
+            policy_probs = self.policy(hidden)
+            # print("Policy probabilities: ", policy_probs)
+            policy_dist = torch.distributions.categorical.Categorical(probs=policy_probs)
+        except Exception as e:
+            print("State: ", state)
+            print("Hidden: ", hidden)
+            print("Policy_probs: ", policy_probs)
+            # print("Policy_dist:", policy_dist)
+            print("Exception:", e)
+            return e
 
         if deterministic:
-            action = torch.argmax(policy_logits)
+            action = torch.argmax(policy_probs)
         else:
             action = policy_dist.sample()
 
@@ -272,7 +286,8 @@ class Actor(nn.Module):
     @torch.no_grad()
     def act(self, state: np.ndarray, device: str) -> np.ndarray:
         deterministic = not self.training
-        state = torch.tensor(state, device=device, dtype=torch.float32)
+        state = torch.tensor(np.array(state), device=device, dtype=torch.float32)
+        # print("Act State:", state.shape)
         action = self(state, deterministic=deterministic)[0].cpu().numpy()
         return action
 
@@ -310,6 +325,7 @@ class VectorizedCritic(nn.Module):
         )
         # [num_actions, num_critics, batch_size]
         q_values = self.critic(state).squeeze(-1)
+        # print("Q values: ", q_values)
         return q_values
 
 
@@ -323,7 +339,7 @@ class SACN:
         gamma: float = 0.99,
         tau: float = 0.005,
         alpha_learning_rate: float = 1e-4,
-        device: str = "cpu",
+        device: str = "cuda",
     ):
         self.device = device
 
@@ -401,6 +417,7 @@ class SACN:
 
         # Alpha update
         alpha_loss = self._alpha_loss(state)
+        # print("Alpha loss: ", alpha_loss)
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
@@ -409,12 +426,14 @@ class SACN:
 
         # Actor update
         actor_loss, actor_batch_entropy, q_policy_std = self._actor_loss(state)
+        # print("Actor loss: ", actor_loss, " Entropy: ", actor_batch_entropy, " Q std: ", q_policy_std)
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
         # Critic update
         critic_loss = self._critic_loss(state, action, reward, next_state, done)
+        # print("Critic loss: ", critic_loss)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
@@ -423,7 +442,7 @@ class SACN:
         with torch.no_grad():
             soft_update(self.target_critic, self.critic, tau=self.tau)
             # for logging, Q-ensemble std estimate with the random actions:
-            random_actions = torch.randint(low=0, high=self.actor.num_actions-1, size=action.shape).squeeze()
+            random_actions = torch.randint(low=0, high=self.actor.num_actions-1, size=action.shape, device=self.device).squeeze()
             random_actions = torch.nn.functional.one_hot(random_actions,num_classes=self.actor.num_actions)
             q_random_std = (random_actions * self.critic(state)).sum(-1).std(0).mean().item()
 
@@ -465,16 +484,26 @@ class SACN:
 def eval_actor(
     env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    # env.seed(seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        state, done = env.reset(seed=seed), False
+        state = state[0].reshape(-1)
+        # print("Eval State:", state.shape)
         episode_reward = 0.0
-        while not done:
+        max_steps = 1000
+        step_count = 0
+        while not done and step_count < max_steps:
             action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            state, reward, done, _, _ = env.step(action)
+            # print("Eval State2:", state.shape)
+            state = state.reshape(-1)
+            # print("Eval State3:", state.shape)
             episode_reward += reward
+            step_count += 1
+            # print(step_count)
+        # print("Eval State4:", state.shape)
         episode_rewards.append(episode_reward)
 
     actor.train()
@@ -568,42 +597,51 @@ def train(config: TrainConfig):
 
     total_updates = 0.0
     for epoch in trange(config.num_epochs, desc="Training"):
-        # training
-        for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-            batch = buffer.sample(config.batch_size)
-            update_info = trainer.update(batch)
+        try:
+            # training
+            for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
+                try:
+                    batch = buffer.sample(config.batch_size)
+                    update_info = trainer.update(batch)
 
-            if total_updates % config.log_every == 0:
-                wandb.log({"epoch": epoch, **update_info})
+                    if total_updates % config.log_every == 0:
+                        wandb.log({"epoch": epoch, **update_info})
 
-            total_updates += 1
+                    total_updates += 1
+                except Exception as e:
+                    print("Epoch:", epoch, "Updates:", total_updates)
+                    print("Exception:", e)
 
-        # evaluation
-        if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            eval_returns = eval_actor(
-                env=eval_env,
-                actor=actor,
-                n_episodes=config.eval_episodes,
-                seed=config.eval_seed,
-                device=config.device,
-            )
-            eval_log = {
-                "eval/reward_mean": np.mean(eval_returns),
-                "eval/reward_std": np.std(eval_returns),
-                "epoch": epoch,
-            }
-            if hasattr(eval_env, "get_normalized_score"):
-                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
-                eval_log["eval/normalized_score_std"] = np.std(normalized_score)
-
-            wandb.log(eval_log)
-
-            if config.checkpoints_path is not None:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"{epoch}.pt"),
+            # evaluation
+            if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
+                eval_returns = eval_actor(
+                    env=eval_env,
+                    actor=actor,
+                    n_episodes=config.eval_episodes,
+                    seed=config.eval_seed,
+                    device=config.device,
                 )
+                eval_log = {
+                    "eval/reward_mean": np.mean(eval_returns),
+                    "eval/reward_std": np.std(eval_returns),
+                    "epoch": epoch,
+                }
+                if hasattr(eval_env, "get_normalized_score"):
+                    normalized_score = eval_env.unwrapped.get_normalized_score(eval_returns) * 100.0
+                    eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
+                    eval_log["eval/normalized_score_std"] = np.std(normalized_score)
+
+                wandb.log(eval_log)
+
+                if config.checkpoints_path is not None:
+                    torch.save(
+                        trainer.state_dict(),
+                        os.path.join(config.checkpoints_path, f"{epoch}.pt"),
+                    )
+
+        except Exception as e:
+            print(f"Error during training at epoch {epoch}: {str(e)}")
+            break
 
     wandb.finish()
 
